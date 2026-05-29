@@ -30,6 +30,25 @@ export default function App() {
   // Determine dynamic callback URI & enable manual override via interactive configuration
   const [redirectUri, setRedirectUri] = useState<string>("");
 
+  // Persistent user preference for direct redirection VS. browser popup window
+  const [useDirectRedirect, setUseDirectRedirectState] = useState<boolean>(() => {
+    try {
+      const val = localStorage.getItem("deriv_oauth_use_direct_redirect");
+      return val !== "false"; // default to true
+    } catch {
+      return true;
+    }
+  });
+
+  const setUseDirectRedirect = (val: boolean) => {
+    setUseDirectRedirectState(val);
+    try {
+      localStorage.setItem("deriv_oauth_use_direct_redirect", String(val));
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
   useEffect(() => {
     try {
       const savedRedirect = localStorage.getItem("deriv_oauth_redirect_uri");
@@ -364,20 +383,26 @@ export default function App() {
       // Let trace flicker slightly to look high-tech
       await new Promise(resolve => setTimeout(resolve, 800));
 
-      // Open OAuth vendor prompt directly in a popup (Avoid iframe redirections block)
-      const popupWidth = 600;
-      const popupHeight = 700;
-      const left = window.screen.width / 2 - popupWidth / 2;
-      const top = window.screen.height / 2 - popupHeight / 2;
+      // Either redirect directly or open in popup depending on user selection
+      if (useDirectRedirect) {
+        // Direct browser address redirection
+        window.location.href = url;
+      } else {
+        // Open OAuth vendor prompt directly in a popup (Avoid iframe redirections block)
+        const popupWidth = 600;
+        const popupHeight = 700;
+        const left = window.screen.width / 2 - popupWidth / 2;
+        const top = window.screen.height / 2 - popupHeight / 2;
 
-      const authWindow = window.open(
-        url,
-        "deriv_oauth_popup",
-        `width=${popupWidth},height=${popupHeight},top=${top},left=${left},resizable=yes,scrollbars=yes`
-      );
+        const authWindow = window.open(
+          url,
+          "deriv_oauth_popup",
+          `width=${popupWidth},height=${popupHeight},top=${top},left=${left},resizable=yes,scrollbars=yes`
+        );
 
-      if (!authWindow) {
-        throw new Error("Unable to open authentication browser window. Please check if a popup blocker is preventing access.");
+        if (!authWindow) {
+          throw new Error("Unable to open authentication browser window. Please check if a popup blocker is preventing access.");
+        }
       }
     } catch (err: any) {
       console.error("Initiation failed:", err);
@@ -487,6 +512,8 @@ export default function App() {
               activeBalance={activeBalance}
               wsState={wsState}
               wsError={wsError}
+              useDirectRedirect={useDirectRedirect}
+              setUseDirectRedirect={setUseDirectRedirect}
             />
           </div>
 

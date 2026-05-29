@@ -219,7 +219,11 @@ async function startServer() {
                     document.write('<p style="color:#22c55e; font-size: 0.875rem; margin-top: 1rem;">Notified parent window. Closing popup...</p>');
                     setTimeout(() => { window.close(); }, 1200);
                   } else {
-                    document.write('<p style="color:#22c55e; font-size: 0.875rem; font-weight: bold; margin-top: 1rem;">Tokens saved locally! You can close this tab and return to the application window.</p>');
+                    document.write('<p style="color:#22c55e; font-size: 0.875rem; font-weight: bold; margin-top: 1rem;">Tokens saved locally! Redirecting to application dashboard...</p>');
+                    localStorage.setItem("deriv_oauth_session", JSON.stringify(payloadResponse));
+                    setTimeout(() => {
+                      window.location.href = "/";
+                    }, 1200);
                   }
                 } catch (err) {
                   console.error("Local storage token exchange error:", err);

@@ -17,6 +17,8 @@ interface CredentialsFormProps {
   activeBalance?: { balance: number; currency: string; loginid: string } | null;
   wsState?: string;
   wsError?: string;
+  useDirectRedirect: boolean;
+  setUseDirectRedirect: (val: boolean) => void;
 }
 
 export default function CredentialsForm({
@@ -33,7 +35,9 @@ export default function CredentialsForm({
   tokenResponse,
   activeBalance,
   wsState = "disconnected",
-  wsError = ""
+  wsError = "",
+  useDirectRedirect,
+  setUseDirectRedirect
 }: CredentialsFormProps) {
   const [activeTab, setActiveTab] = React.useState<"oauth" | "pat">("oauth");
   const [patValue, setPatValue] = React.useState<string>("");
@@ -166,6 +170,21 @@ export default function CredentialsForm({
                     <b>Crucial:</b> This URL must be registered <i>exactly</i> as a Redirect URI in your application profile inside the Deriv Developer Console!
                   </span>
                 </p>
+              </div>
+
+              {/* PERSISTENT FULL-PAGE REDIRECT OPTIONS */}
+              <div className="flex items-center gap-2.5 py-1 select-none">
+                <input
+                  id="direct-redirect-toggle"
+                  type="checkbox"
+                  checked={useDirectRedirect}
+                  onChange={(e) => setUseDirectRedirect(e.target.checked)}
+                  className="h-4 w-4 rounded border-white/20 bg-black/40 text-[#ff444f] cursor-pointer"
+                  style={{ accentColor: "#ff444f" }}
+                />
+                <label htmlFor="direct-redirect-toggle" className="text-[11px] font-semibold text-slate-300 cursor-pointer">
+                  Avoid browser popups (use direct tab redirection)
+                </label>
               </div>
 
               {/* TRIGGER BUTTON */}
