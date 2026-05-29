@@ -1,0 +1,33 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: 'Space Grotesk', 'Inter', ui-sans-serif, system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, monospace;
+  
+  --color-deriv: #ff444f;
+  --color-stellar: #0a0b0e;
+  --color-glass-bg: rgba(255, 255, 255, 0.03);
+  --color-glass-border: rgba(255, 255, 255, 0.1);
+
+  @keyframes flash-green {
+    0% { background-color: rgba(16, 185, 129, 0.25); color: #34d399; }
+    100% { background-color: transparent; }
+  }
+  @keyframes flash-red {
+    0% { background-color: rgba(239, 68, 68, 0.25); color: #f87171; }
+    100% { background-color: transparent; }
+  }
+  @keyframes flash-neutral {
+    0% { background-color: rgba(255, 255, 255, 0.15); color: #ffffff; }
+    100% { background-color: transparent; }
+  }
+  --animate-flash-green: flash-green 1s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  --animate-flash-red: flash-red 1s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+  --animate-flash-neutral: flash-neutral 1s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+body {
+  background-color: #0a0b0e;
+  font-family: var(--font-sans);
+}

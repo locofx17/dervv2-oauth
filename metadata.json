@@ -1,0 +1,6 @@
+{
+  "name": "Deriv OAuth 2.0 Login",
+  "description": "Securely authenticate trading accounts using the Deriv OAuth 2.0 protocol with PKCE verification and inspect accounts information.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
