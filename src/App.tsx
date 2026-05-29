@@ -82,6 +82,121 @@ export default function App() {
     }
   }, []);
 
+  // Check if we are mounted inside the OAuth callback popup window (dynamic frontend fallback)
+  useEffect(() => {
+    const handleUrlCallback = async () => {
+      if (typeof window === "undefined") return;
+      
+      const path = window.location.pathname;
+      if (!path.includes("/auth/callback")) return;
+
+      const urlParams = new URLSearchParams(window.location.search);
+      const code = urlParams.get("code");
+      const state = urlParams.get("state");
+      const error = urlParams.get("error");
+      const errorDesc = urlParams.get("error_description");
+
+      // 1. Check for errors
+      if (error || errorDesc) {
+        const errorMsg = errorDesc || error || "Failed to authorize with Deriv.";
+        if (window.opener) {
+          window.opener.postMessage({ type: "OAUTH_AUTH_ERROR", error: errorMsg }, "*");
+        }
+        localStorage.setItem("deriv_oauth_error_shuttle", errorMsg);
+        return;
+      }
+
+      // 2. Check if Deriv redirected with tokens directly (implicit flow fallback)
+      const tokenList: Array<{ token: string; lId: string; cur: string }> = [];
+      let index = 1;
+      while (urlParams.has(`token${index}`)) {
+        tokenList.push({
+          token: urlParams.get(`token${index}`)!,
+          lId: urlParams.get(`acct${index}`) || "",
+          cur: urlParams.get(`cur${index}`) || "USD"
+        });
+        index++;
+      }
+
+      if (tokenList.length > 0) {
+        const firstAccount = tokenList[0];
+        const payload: DerivTokenResponse = {
+          access_token: firstAccount.token,
+          is_pat: false,
+          scope: "admin read trade payments",
+          expires_in: 3600,
+          account_list: tokenList.map(t => ({
+            loginid: t.lId,
+            token: t.token,
+            currency: t.cur
+          }))
+        };
+
+        localStorage.setItem("deriv_oauth_session_shuttle", JSON.stringify(payload));
+        if (window.opener) {
+          window.opener.postMessage({ type: "OAUTH_AUTH_SUCCESS", data: payload }, "*");
+          setTimeout(() => {
+            window.close();
+          }, 1000);
+        } else {
+          localStorage.setItem("deriv_oauth_session", JSON.stringify(payload));
+          window.location.href = window.location.origin;
+        }
+        return;
+      }
+
+      // 3. Fallback standard Code-exchange for PKCE via client-side fetch (if backend doesn't handle it)
+      if (code) {
+        const localPkceStr = localStorage.getItem("deriv_oauth_pkce_fallback");
+        if (localPkceStr) {
+          try {
+            const { codeVerifier, state: savedState, clientId: savedClientId, redirectUri } = JSON.parse(localPkceStr);
+            if (state === savedState) {
+              const requestBody = new URLSearchParams({
+                grant_type: "authorization_code",
+                code: code,
+                redirect_uri: redirectUri,
+                client_id: savedClientId,
+                code_verifier: codeVerifier
+              });
+
+              const response = await fetch("https://auth.deriv.com/oauth2/token", {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/x-www-form-urlencoded"
+                },
+                body: requestBody.toString()
+              });
+
+              if (response.ok) {
+                const tokensData = await response.json();
+                localStorage.setItem("deriv_oauth_session_shuttle", JSON.stringify(tokensData));
+                
+                if (window.opener) {
+                  window.opener.postMessage({ type: "OAUTH_AUTH_SUCCESS", data: tokensData }, "*");
+                  setTimeout(() => { window.close(); }, 1000);
+                } else {
+                  localStorage.setItem("deriv_oauth_session", JSON.stringify(tokensData));
+                  window.location.href = window.location.origin;
+                }
+              } else {
+                const errData = await response.json().catch(() => ({}));
+                const errDetail = errData.error_description || errData.error || "Failed client-side exchange handshake.";
+                if (window.opener) {
+                  window.opener.postMessage({ type: "OAUTH_AUTH_ERROR", error: errDetail }, "*");
+                }
+              }
+            }
+          } catch (err: any) {
+            console.error("Client side exchange error:", err);
+          }
+        }
+      }
+    };
+
+    handleUrlCallback();
+  }, []);
+
   // Listen for callback events via postMessage from our popup callback window OR via LocalStorage cross-tab updates
   useEffect(() => {
     const handleMessageEvent = (event: MessageEvent) => {
@@ -99,6 +214,10 @@ export default function App() {
         
         setAlertMsg("✓ Tokens synchronized and saved. You can now execute commands below!");
         setTimeout(() => setAlertMsg(""), 5000);
+      }
+
+      if (event.data?.type === "OAUTH_AUTH_ERROR") {
+        setErrorMsg(event.data.error || "Authorization declined or failed.");
       }
     };
 
@@ -134,6 +253,12 @@ export default function App() {
           setAlertMsg("✓ Tokens synchronized dynamically via LocalStorage polling. You are logged in!");
           setTimeout(() => setAlertMsg(""), 5000);
         }
+
+        const errorShuttle = localStorage.getItem("deriv_oauth_error_shuttle");
+        if (errorShuttle) {
+          setErrorMsg(errorShuttle);
+          localStorage.removeItem("deriv_oauth_error_shuttle");
+        }
       } catch (e) {
         // Silent catch
       }
@@ -156,15 +281,80 @@ export default function App() {
     setAlertMsg("");
 
     try {
-      // Fetch safe authorization setup configurations from server endpoint
-      const response = await fetch(`/api/auth/initiate?client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}`);
-      const payloadData = await response.json();
+      let url = "";
+      let codeVerifier = "";
+      let codeChallenge = "";
+      let state = "";
+      let useClientPkce = false;
 
-      if (!response.ok) {
-        throw new Error(payloadData.error || "Failed to launch PKCE session");
+      try {
+        // Fetch safe authorization setup configurations from server endpoint
+        const response = await fetch(`/api/auth/initiate?client_id=${clientId}&redirect_uri=${encodeURIComponent(redirectUri)}`);
+        
+        if (!response.ok) {
+          useClientPkce = true;
+        } else {
+          const contentType = response.headers.get("content-type") || "";
+          if (!contentType.includes("application/json")) {
+            useClientPkce = true;
+          } else {
+            const payloadData = await response.json();
+            url = payloadData.url;
+            codeVerifier = payloadData.codeVerifier;
+            codeChallenge = payloadData.codeChallenge;
+            state = payloadData.state;
+          }
+        }
+      } catch (err) {
+        console.warn("Express backend authentication initiation failed or missing. Falling back to browser-native client-side PKCE engine...", err);
+        useClientPkce = true;
       }
 
-      const { url, codeVerifier, codeChallenge, state } = payloadData;
+      if (useClientPkce) {
+        // Pure browser PKCE implementation fallback
+        const dec2hex = (dec: number) => dec.toString(16).padStart(2, "0");
+        const generateVerifier = () => {
+          const array = new Uint8Array(32);
+          window.crypto.getRandomValues(array);
+          return btoa(String.fromCharCode.apply(null, Array.from(array)))
+            .replace(/\+/g, "-")
+            .replace(/\//g, "_")
+            .replace(/=+$/, "");
+        };
+
+        codeVerifier = generateVerifier();
+
+        const encoder = new TextEncoder();
+        const data = encoder.encode(codeVerifier);
+        const hashBuffer = await window.crypto.subtle.digest("SHA-256", data);
+        codeChallenge = btoa(String.fromCharCode.apply(null, Array.from(new Uint8Array(hashBuffer))))
+          .replace(/\+/g, "-")
+          .replace(/\//g, "_")
+          .replace(/=+$/, "");
+
+        const stateObj = new Uint8Array(16);
+        window.crypto.getRandomValues(stateObj);
+        state = Array.from(stateObj, dec2hex).join("");
+
+        const params = new URLSearchParams({
+          client_id: clientId,
+          redirect_uri: redirectUri,
+          response_type: "code",
+          code_challenge: codeChallenge,
+          code_challenge_method: "S256",
+          state: state
+        });
+
+        url = `https://auth.deriv.com/oauth2/auth?${params.toString()}`;
+
+        // Save fallback state so the callback popup can read it
+        localStorage.setItem("deriv_oauth_pkce_fallback", JSON.stringify({
+          codeVerifier,
+          state,
+          clientId,
+          redirectUri
+        }));
+      }
 
       // Update visible trace parameters for developers
       setCodeVerifierTrace(codeVerifier || "");
