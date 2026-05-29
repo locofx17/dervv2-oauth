@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from "react";
-import { Terminal, Send, CheckCircle, Wifi, WifiOff, RefreshCw, Coins, TrendingUp, Wallet, Copy, Check } from "lucide-react";
+import { Terminal, Send, CheckCircle, Wifi, WifiOff, RefreshCw, Coins, TrendingUp, Wallet, Copy, Check, Flame } from "lucide-react";
 import { DerivTokenResponse, WebSocketMessage, DerivAuthorizeDetails, DerivAccount } from "../types";
+import QuickTrade from "./QuickTrade";
 
 interface WebSocketTesterProps {
   tokenResponse: DerivTokenResponse | null;
@@ -32,9 +33,19 @@ export default function WebSocketTester({
       onErrorUpdate(errorDetails);
     }
   }, [errorDetails, onErrorUpdate]);
+
   const [logMessages, setLogMessages] = useState<Array<{ type: "send" | "receive" | "status"; msg: any; time: string }>>([]);
   const [authData, setAuthData] = useState<DerivAuthorizeDetails | null>(null);
   const [activeAccount, setActiveAccount] = useState<DerivAccount | null>(null);
+
+  // Tabs toggle to switch between Detailed Portfolio list and Quick Trade desk
+  const [leftTab, setLeftTab] = useState<"portfolio" | "trade">("trade");
+
+  // Trading execution states
+  const [tradeState, setTradeState] = useState<"idle" | "placing" | "purchased" | "running" | "won" | "lost" | "error">("idle");
+  const [tradeError, setTradeError] = useState<string>("");
+  const [purchaseReceipt, setPurchaseReceipt] = useState<any>(null);
+  const [contractProgress, setContractProgress] = useState<any>(null);
   
   // Flash tracking for accounts balance updates
   const [balanceFlash, setBalanceFlash] = useState<Record<string, { type: "green" | "red" | "neutral"; key: number }>>({});
@@ -189,6 +200,12 @@ export default function WebSocketTester({
     setWsState("disconnected");
     setAuthData(null);
     setActiveAccount(null);
+    
+    // Reset trading state parameters
+    setTradeState("idle");
+    setTradeError("");
+    setPurchaseReceipt(null);
+    setContractProgress(null);
   };
 
   // Connect and Authenticate through the retrieved OAuth token
@@ -225,9 +242,16 @@ export default function WebSocketTester({
           appendLog("receive", response);
 
           if (response.error) {
-            setWsState("error");
-            setErrorDetails(response.error.message);
-            appendLog("status", `API handshaking error: ${response.error.message}`);
+            // Isolate trade placement or contract tracking errors from generic socket errors so connectivity is preserved
+            if (response.msg_type === "buy" || response.echo_req?.buy || response.echo_req?.proposal_open_contract || tradeState === "placing") {
+              setTradeState("error");
+              setTradeError(response.error.message);
+              appendLog("status", `❌ Trade Execution Error: ${response.error.message}`);
+            } else {
+              setWsState("error");
+              setErrorDetails(response.error.message);
+              appendLog("status", `API handshaking error: ${response.error.message}`);
+            }
           } else if (response.msg_type === "authorize" && response.authorize) {
             setWsState("authorized");
             
@@ -334,6 +358,48 @@ export default function WebSocketTester({
             });
 
             appendLog("status", `ⓘ Real-time Balance updated under ${targetLoginid}: ${newBal} ${response.balance.currency}`);
+          } else if (response.msg_type === "buy" && response.buy) {
+            // Success contract bought receipt!
+            setPurchaseReceipt(response.buy);
+            setTradeState("running");
+            setContractProgress({
+              tick_count: 0,
+              tick_stream: []
+            });
+            appendLog("status", `✓ Contract bought successfully! ID: ${response.buy.contract_id}. Subscribing to live telemetry feed...`);
+
+            // Subscribe to open contract updates to track tick resolution
+            const pocRequest = {
+              proposal_open_contract: 1,
+              contract_id: response.buy.contract_id,
+              subscribe: 1
+            };
+            appendLog("send", pocRequest);
+            socket.send(JSON.stringify(pocRequest));
+          } else if (response.msg_type === "proposal_open_contract" && response.proposal_open_contract) {
+            const poc = response.proposal_open_contract;
+            
+            setContractProgress((prev: any) => {
+              const stream = prev?.tick_stream ? [...prev.tick_stream] : [];
+              if (poc.tick_count && !stream.some((t: any) => t.count === poc.tick_count)) {
+                stream.push({
+                  count: poc.tick_count,
+                  raw: String(poc.current_spot || poc.exit_tick || "")
+                });
+              }
+              return {
+                ...poc,
+                tick_stream: stream
+              };
+            });
+
+            if (poc.status === "won") {
+              setTradeState("won");
+              appendLog("status", `🎉 [WIN] Contract settled. Profit: +$${poc.profit || "0"}`);
+            } else if (poc.status === "lost") {
+              setTradeState("lost");
+              appendLog("status", `📉 [LOSS] Contract settled out of bounds. Loss: -$${poc.profit ? Math.abs(poc.profit) : "0"}`);
+            }
           }
         } catch (err: any) {
           appendLog("status", `Error processing trace frames: ${err.message}`);
@@ -402,6 +468,50 @@ export default function WebSocketTester({
       socketRef.current.send(JSON.stringify(parsed));
     } catch (err: any) {
       appendLog("status", `Compiling logic parsing failure: ${err.message}`);
+    }
+  };
+
+  // Place binary option trades on Deriv exchange
+  const handlePlaceTrade = (contractPayload: any) => {
+    if (!socketRef.current || wsState !== "authorized") {
+      setTradeState("error");
+      setTradeError("WebSocket connection is not active or unauthorized.");
+      return;
+    }
+    setTradeState("placing");
+    setTradeError("");
+    setPurchaseReceipt(null);
+    setContractProgress(null);
+
+    appendLog("send", contractPayload);
+    try {
+      socketRef.current.send(JSON.stringify(contractPayload));
+    } catch (err: any) {
+      setTradeState("error");
+      setTradeError(err.message);
+      appendLog("status", `❌ Failed to broadcast purchase frame: ${err.message}`);
+    }
+  };
+
+  const handleResetTradeState = () => {
+    setTradeState("idle");
+    setTradeError("");
+    setPurchaseReceipt(null);
+    setContractProgress(null);
+  };
+
+  const handleSwitchAccount = (loginid: string) => {
+    if (!authData) return;
+    const targetAcc = authData.account_list?.find(a => a.loginid === loginid);
+    if (!targetAcc) return;
+
+    setActiveAccount(targetAcc);
+    const accToken = getTokenForLoginid(loginid);
+    if (accToken && socketRef.current && wsState === "authorized" && loginid !== authData.loginid) {
+      appendLog("status", `Requesting to switch workspace profile context to ${loginid}...`);
+      const authRequest = { authorize: accToken };
+      appendLog("send", authRequest);
+      socketRef.current.send(JSON.stringify(authRequest));
     }
   };
 
@@ -480,7 +590,7 @@ export default function WebSocketTester({
                 {/* Profile Results rendering */}
                 {authData ? (
                   <div className="space-y-5">
-                    <div className="bg-black/40 border border-white/5 p-5 rounded-2xl space-y-3 relative overflow-hidden">
+                    <div className="bg-black/45 border border-white/5 p-5 rounded-2xl space-y-3 relative overflow-hidden">
                       <div className="flex justify-between items-start">
                         <div>
                           <h3 className="text-sm font-bold text-white uppercase tracking-wider">{authData.fullname}</h3>
@@ -498,197 +608,245 @@ export default function WebSocketTester({
                         </div>
                         <div>
                           <span className="block text-[9px] text-slate-500 font-mono tracking-widest font-bold">REALTIME BALANCE</span>
-                          <span className="text-sm font-black font-mono text-emerald-400">
-                            {parseFloat(authData.balance || "0").toLocaleString(undefined, {minimumFractionDigits: 2})}
+                          <span className="text-sm font-black font-mono text-emerald-400 flex items-center gap-1">
+                            <span>$</span>
+                            <span>{parseFloat(authData.balance || "0").toLocaleString(undefined, {minimumFractionDigits: 2})}</span>
                           </span>
                         </div>
                       </div>
                     </div>
 
-                    {/* Accounts Balance Summary Table */}
-                    <div className="bg-gradient-to-br from-black/50 to-black/35 border border-white/5 p-5 rounded-2xl space-y-4">
-                      <div className="flex items-center gap-2 pb-2.5 border-b border-white/5">
-                        <Wallet className="h-4 w-4 text-[#ff444f]" />
-                        <h4 className="text-[10px] font-black text-white uppercase tracking-wider font-mono">
-                          Accounts Balances Summary
-                        </h4>
+                    {/* Dynamic Action Mode Tab selector */}
+                    <div className="flex bg-black/40 p-1 rounded-xl border border-white/5 gap-1.5 font-mono">
+                      <button
+                        type="button"
+                        onClick={() => setLeftTab("trade")}
+                        className={`flex-grow py-3 rounded-lg text-xs font-black uppercase tracking-wider flex items-center justify-center gap-2 cursor-pointer transition-all ${
+                          leftTab === "trade"
+                            ? "bg-[#ff444f] text-white shadow-[0_3px_12px_rgba(255,68,79,0.3)] font-bold scale-[1.02]"
+                            : "text-slate-400 hover:text-slate-200 hover:bg-white/5"
+                        }`}
+                      >
+                        <Flame className="h-4 w-4 text-orange-400 animate-pulse" />
+                        Quick Trade Desk
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setLeftTab("portfolio")}
+                        className={`flex-grow py-3 rounded-lg text-xs font-black uppercase tracking-wider flex items-center justify-center gap-2 cursor-pointer transition-all ${
+                          leftTab === "portfolio"
+                            ? "bg-white/10 text-white border border-white/10 scale-[1.02]"
+                            : "text-slate-400 hover:text-slate-200 hover:bg-white/5"
+                        }`}
+                      >
+                        <Wallet className="h-4 w-4" />
+                        Detailed Portfolios
+                      </button>
+                    </div>
+
+                    {leftTab === "trade" ? (
+                      <div className="space-y-4 animate-fade-in">
+                        <QuickTrade
+                          wsState={wsState}
+                          activeAccount={activeAccount}
+                          accountsList={authData.account_list || []}
+                          onSwitchAccount={handleSwitchAccount}
+                          onPlaceTrade={handlePlaceTrade}
+                          tradeState={tradeState}
+                          tradeError={tradeError}
+                          purchaseReceipt={purchaseReceipt}
+                          contractProgress={contractProgress}
+                          onResetTradeState={handleResetTradeState}
+                        />
                       </div>
-
-                      <div className="overflow-x-auto">
-                        <table className="w-full text-left border-collapse font-mono text-[11px] leading-relaxed">
-                          <thead>
-                            <tr className="border-b border-white/5 text-[9px] text-slate-500 uppercase tracking-widest font-bold">
-                              <th className="py-2">Account ID</th>
-                              <th className="py-2">Type</th>
-                              <th className="py-2">Currency</th>
-                              <th className="py-2 text-right">Balance</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            {authData.account_list?.map((acc) => {
-                              const bal = getAccountBalance(acc);
-                              const isVirtual = acc.is_virtual === 1 || acc.is_virtual === true || String(acc.is_virtual) === "true";
-                              const isActive = activeAccount?.loginid === acc.loginid;
-                              
-                              const flash = balanceFlash[acc.loginid];
-                              const animationClass = flash
-                                ? flash.type === "green"
-                                  ? "animate-flash-green"
-                                  : flash.type === "red"
-                                  ? "animate-flash-red"
-                                  : "animate-flash-neutral"
-                                : "";
-
-                              return (
-                                <tr key={acc.loginid} className="border-b border-white/5 hover:bg-white/5 transition-colors group">
-                                  <td className="py-2.5 font-bold text-slate-300 flex items-center gap-1.5">
-                                    <span>{acc.loginid}</span>
-                                    <button
-                                      onClick={(e) => copyToClipboard(acc.loginid, e)}
-                                      title={`Copy Account ID: ${acc.loginid}`}
-                                      className="p-1 hover:bg-white/10 text-slate-500 hover:text-emerald-400 rounded transition-all shrink-0 cursor-pointer flex items-center justify-center opacity-0 group-hover:opacity-100 focus:opacity-100 ml-0.5"
-                                      aria-label="Copy Account Login ID"
-                                    >
-                                      {copiedStates[acc.loginid] ? (
-                                        <Check className="h-3 w-3 text-emerald-400 animate-pulse" />
-                                      ) : (
-                                        <Copy className="h-3 w-3 transition-transform active:scale-75" />
-                                      )}
-                                    </button>
-
-                                    <button
-                                      onClick={(e) => refreshAccountBalance(acc.loginid, e)}
-                                      disabled={wsState !== "authorized"}
-                                      title={`Sync/Refresh balance for ${acc.loginid}`}
-                                      className="p-1 hover:bg-white/10 text-slate-500 hover:text-emerald-400 rounded transition-all shrink-0 cursor-pointer flex items-center justify-center opacity-0 group-hover:opacity-100 focus:opacity-100 ml-0.5 disabled:opacity-35 disabled:cursor-not-allowed"
-                                      aria-label="Refresh Account Balance"
-                                    >
-                                      <RefreshCw className={`h-3 w-3 ${refreshingAccounts[acc.loginid] ? "animate-spin text-emerald-400" : "transition-transform active:rotate-180"}`} />
-                                    </button>
-
-                                    {isActive && (
-                                      <span className="text-[8px] bg-[#ff444f]/15 text-[#ff444f] border border-[#ff444f]/30 px-1 py-0.2 rounded font-sans font-black uppercase tracking-wider shrink-0">
-                                        ACTIVE
-                                      </span>
-                                    )}
-                                  </td>
-                                  <td className="py-2.5">
-                                    <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded leading-none ${
-                                      isVirtual 
-                                        ? "text-emerald-400 bg-emerald-500/10 border border-emerald-500/25" 
-                                        : "text-amber-400 bg-amber-500/10 border border-amber-500/25"
-                                    }`}>
-                                      {isVirtual ? "Demo" : "Real"}
-                                    </span>
-                                  </td>
-                                  <td className="py-2.5 text-slate-400 font-bold uppercase">{acc.currency || "USD"}</td>
-                                  <td 
-                                    key={`${acc.loginid}-bal-${flash?.key || 0}`}
-                                    className={`py-2.5 text-right font-bold transition-all px-2 rounded-lg ${
-                                      animationClass || (isVirtual ? "text-emerald-400" : "text-slate-200")
-                                    }`}
-                                  >
-                                    {bal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
-                                  </td>
-                                </tr>
-                              );
-                            })}
-                          </tbody>
-                        </table>
-                      </div>
-
-                      {/* Portfolio totals calculation summary */}
-                      {(summaries.real.length > 0 || summaries.demo.length > 0) && (
-                        <div className="pt-3 border-t border-white/5 space-y-2">
-                          <div className="flex items-center gap-1.5">
-                            <Coins className="h-3.5 w-3.5 text-slate-500" />
-                            <span className="text-[9px] text-slate-500 uppercase tracking-widest font-mono font-bold">
-                              Aggregated Portfolio Totals
-                            </span>
+                    ) : (
+                      <div className="space-y-5 animate-fade-in">
+                        {/* Accounts Balance Summary Table */}
+                        <div className="bg-gradient-to-br from-black/50 to-black/35 border border-white/5 p-5 rounded-2xl space-y-4">
+                          <div className="flex items-center gap-2 pb-2.5 border-b border-white/5">
+                            <Wallet className="h-4 w-4 text-[#ff444f]" />
+                            <h4 className="text-[10px] font-black text-white uppercase tracking-wider font-mono">
+                              Accounts Balances Summary
+                            </h4>
                           </div>
-                          
-                          <div className="bg-black/45 p-3 rounded-xl border border-white/5 space-y-2">
-                            {summaries.real.length > 0 && (
-                              <div className="flex flex-wrap items-center justify-between text-[11px] font-mono">
-                                <span className="text-slate-400 font-bold uppercase tracking-wider text-[9px] flex items-center gap-1">
-                                  <TrendingUp className="h-3 w-3 text-amber-500" /> Real Balance Summarized:
-                                </span>
-                                <div className="flex gap-3">
-                                  {summaries.real.map(({ currency, total }) => (
-                                    <span key={currency} className="text-amber-400 font-black">
-                                      {total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} <small className="text-[9px] text-slate-400">{currency}</small>
-                                    </span>
-                                  ))}
-                                </div>
-                              </div>
-                            )}
 
-                            {summaries.demo.length > 0 && (
-                              <div className="flex flex-wrap items-center justify-between text-[11px] font-mono">
-                                <span className="text-slate-400 font-bold uppercase tracking-wider text-[9px] flex items-center gap-1">
-                                  <TrendingUp className="h-3 w-3 text-emerald-500" /> Demo Balance Summarized:
+                          <div className="overflow-x-auto">
+                            <table className="w-full text-left border-collapse font-mono text-[11px] leading-relaxed">
+                              <thead>
+                                <tr className="border-b border-white/5 text-[9px] text-slate-500 uppercase tracking-widest font-bold">
+                                  <th className="py-2">Account ID</th>
+                                  <th className="py-2">Type</th>
+                                  <th className="py-2">Currency</th>
+                                  <th className="py-2 text-right">Balance</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                {authData.account_list?.map((acc) => {
+                                  const bal = getAccountBalance(acc);
+                                  const isVirtual = acc.is_virtual === 1 || acc.is_virtual === true || String(acc.is_virtual) === "true";
+                                  const isActive = activeAccount?.loginid === acc.loginid;
+                                  
+                                  const flash = balanceFlash[acc.loginid];
+                                  const animationClass = flash
+                                    ? flash.type === "green"
+                                      ? "animate-flash-green"
+                                      : flash.type === "red"
+                                      ? "animate-flash-red"
+                                      : "animate-flash-neutral"
+                                    : "";
+
+                                  return (
+                                    <tr key={acc.loginid} className="border-b border-white/5 hover:bg-white/5 transition-colors group">
+                                      <td className="py-2.5 font-bold text-slate-300 flex items-center gap-1.5">
+                                        <span>{acc.loginid}</span>
+                                        <button
+                                          onClick={(e) => copyToClipboard(acc.loginid, e)}
+                                          title={`Copy Account ID: ${acc.loginid}`}
+                                          className="p-1 hover:bg-white/10 text-slate-500 hover:text-emerald-400 rounded transition-all shrink-0 cursor-pointer flex items-center justify-center opacity-0 group-hover:opacity-100 focus:opacity-100 ml-0.5"
+                                          aria-label="Copy Account Login ID"
+                                        >
+                                          {copiedStates[acc.loginid] ? (
+                                            <Check className="h-3 w-3 text-emerald-400 animate-pulse" />
+                                          ) : (
+                                            <Copy className="h-3 w-3 transition-transform active:scale-75" />
+                                          )}
+                                        </button>
+
+                                        <button
+                                          onClick={(e) => refreshAccountBalance(acc.loginid, e)}
+                                          disabled={wsState !== "authorized"}
+                                          title={`Sync/Refresh balance for ${acc.loginid}`}
+                                          className="p-1 hover:bg-white/10 text-slate-500 hover:text-emerald-400 rounded transition-all shrink-0 cursor-pointer flex items-center justify-center opacity-0 group-hover:opacity-100 focus:opacity-100 ml-0.5 disabled:opacity-35 disabled:cursor-not-allowed"
+                                          aria-label="Refresh Account Balance"
+                                        >
+                                          <RefreshCw className={`h-3 w-3 ${refreshingAccounts[acc.loginid] ? "animate-spin text-emerald-400" : "transition-transform active:rotate-180"}`} />
+                                        </button>
+
+                                        {isActive && (
+                                          <span className="text-[8px] bg-[#ff444f]/15 text-[#ff444f] border border-[#ff444f]/30 px-1 py-0.2 rounded font-sans font-black uppercase tracking-wider shrink-0">
+                                            ACTIVE
+                                          </span>
+                                        )}
+                                      </td>
+                                      <td className="py-2.5">
+                                        <span className={`text-[9px] font-bold px-1.5 py-0.5 rounded leading-none ${
+                                          isVirtual 
+                                            ? "text-emerald-400 bg-emerald-500/10 border border-emerald-500/25" 
+                                            : "text-amber-400 bg-amber-500/10 border border-amber-500/25"
+                                        }`}>
+                                          {isVirtual ? "Demo" : "Real"}
+                                        </span>
+                                      </td>
+                                      <td className="py-2.5 text-slate-400 font-bold uppercase">{acc.currency || "USD"}</td>
+                                      <td 
+                                        key={`${acc.loginid}-bal-${flash?.key || 0}`}
+                                        className={`py-2.5 text-right font-bold transition-all px-2 rounded-lg ${
+                                          animationClass || (isVirtual ? "text-emerald-400" : "text-slate-200")
+                                        }`}
+                                      >
+                                        {bal.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                                      </td>
+                                    </tr>
+                                  );
+                                })}
+                              </tbody>
+                            </table>
+                          </div>
+
+                          {/* Portfolio totals calculation summary */}
+                          {(summaries.real.length > 0 || summaries.demo.length > 0) && (
+                            <div className="pt-3 border-t border-white/5 space-y-2">
+                              <div className="flex items-center gap-1.5">
+                                <Coins className="h-3.5 w-3.5 text-slate-500" />
+                                <span className="text-[9px] text-slate-500 uppercase tracking-widest font-mono font-bold">
+                                  Aggregated Portfolio Totals
                                 </span>
-                                <div className="flex gap-3">
-                                  {summaries.demo.map(({ currency, total }) => (
-                                    <span key={currency} className="text-emerald-400 font-black">
-                                      {total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} <small className="text-[9px] text-slate-400">{currency}</small>
+                              </div>
+                              
+                              <div className="bg-black/45 p-3 rounded-xl border border-white/5 space-y-2">
+                                {summaries.real.length > 0 && (
+                                  <div className="flex flex-wrap items-center justify-between text-[11px] font-mono">
+                                    <span className="text-slate-400 font-bold uppercase tracking-wider text-[9px] flex items-center gap-1">
+                                      <TrendingUp className="h-3 w-3 text-amber-500" /> Real Balance Summarized:
                                     </span>
-                                  ))}
+                                    <div className="flex gap-3">
+                                      {summaries.real.map(({ currency, total }) => (
+                                        <span key={currency} className="text-amber-400 font-black">
+                                          {total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} <small className="text-[9px] text-slate-400">{currency}</small>
+                                        </span>
+                                      ))}
+                                    </div>
+                                  </div>
+                                )}
+
+                                {summaries.demo.length > 0 && (
+                                  <div className="flex flex-wrap items-center justify-between text-[11px] font-mono">
+                                    <span className="text-slate-400 font-bold uppercase tracking-wider text-[9px] flex items-center gap-1">
+                                      <TrendingUp className="h-3 w-3 text-emerald-500" /> Demo Balance Summarized:
+                                    </span>
+                                    <div className="flex gap-3">
+                                      {summaries.demo.map(({ currency, total }) => (
+                                        <span key={currency} className="text-emerald-400 font-black">
+                                          {total.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })} <small className="text-[9px] text-slate-400">{currency}</small>
+                                        </span>
+                                      ))}
+                                    </div>
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                          )}
+                        </div>
+
+                        {/* Accounts Tab lists */}
+                        <div className="space-y-2">
+                          <h4 className="text-[9px] font-black text-slate-500 uppercase tracking-widest">Available Trading Profiles</h4>
+                          <div className="space-y-2 max-h-40 overflow-y-auto pr-1">
+                            {authData.account_list?.map((acc) => (
+                              <div
+                                key={acc.loginid}
+                                onClick={() => {
+                                  setActiveAccount(acc);
+                                  const accToken = getTokenForLoginid(acc.loginid);
+                                  if (accToken && socketRef.current && wsState === "authorized" && acc.loginid !== authData.loginid) {
+                                    appendLog("status", `Requesting to switch workspace profile context to ${acc.loginid}...`);
+                                    const authRequest = { authorize: accToken };
+                                    appendLog("send", authRequest);
+                                    socketRef.current.send(JSON.stringify(authRequest));
+                                  }
+                                }}
+                                className={`p-4 border rounded-xl flex items-center justify-between cursor-pointer transition-all ${
+                                  activeAccount?.loginid === acc.loginid
+                                    ? "bg-gradient-to-r from-[#ff444f]/10 via-[#ff444f]/5 to-transparent border-[#ff444f]/40 shadow-inner"
+                                    : "bg-black/30 border-white/5 hover:border-white/20"
+                                }`}
+                              >
+                                <div>
+                                  <div className="text-xs font-mono font-bold text-white tracking-wider">
+                                    {acc.loginid}
+                                  </div>
+                                  <div className="text-[10px] text-slate-500 flex items-center gap-1.5 mt-1">
+                                    <span>CLASS: {acc.account_category?.toUpperCase()}</span>
+                                    <span>•</span>
+                                    <span>TYPE: {acc.account_type?.toUpperCase()}</span>
+                                  </div>
+                                </div>
+
+                                <div className="text-right">
+                                  <span className={`text-[9px] font-bold px-2.5 py-1 rounded-md uppercase border ${
+                                    acc.is_virtual 
+                                      ? "bg-emerald-500/10 border-emerald-500/20 text-emerald-400" 
+                                      : "bg-amber-500/10 border-amber-500/20 text-amber-400"
+                                  }`}>
+                                    {acc.is_virtual ? "Demo Acc" : "Real Acc"}
+                                  </span>
                                 </div>
                               </div>
-                            )}
+                            ))}
                           </div>
                         </div>
-                      )}
-                    </div>
-
-                    {/* Accounts Tab lists */}
-                    <div className="space-y-2">
-                      <h4 className="text-[9px] font-black text-slate-500 uppercase tracking-widest">Available Trading Profiles</h4>
-                      <div className="space-y-2 max-h-40 overflow-y-auto pr-1">
-                        {authData.account_list?.map((acc) => (
-                          <div
-                            key={acc.loginid}
-                            onClick={() => {
-                              setActiveAccount(acc);
-                              const accToken = getTokenForLoginid(acc.loginid);
-                              if (accToken && socketRef.current && wsState === "authorized" && acc.loginid !== authData.loginid) {
-                                appendLog("status", `Requesting to switch workspace profile context to ${acc.loginid}...`);
-                                const authRequest = { authorize: accToken };
-                                appendLog("send", authRequest);
-                                socketRef.current.send(JSON.stringify(authRequest));
-                              }
-                            }}
-                            className={`p-4 border rounded-xl flex items-center justify-between cursor-pointer transition-all ${
-                              activeAccount?.loginid === acc.loginid
-                                ? "bg-gradient-to-r from-[#ff444f]/10 via-[#ff444f]/5 to-transparent border-[#ff444f]/40 shadow-inner"
-                                : "bg-black/30 border-white/5 hover:border-white/20"
-                            }`}
-                          >
-                            <div>
-                              <div className="text-xs font-mono font-bold text-white tracking-wider">
-                                {acc.loginid}
-                              </div>
-                              <div className="text-[10px] text-slate-500 flex items-center gap-1.5 mt-1">
-                                <span>CLASS: {acc.account_category?.toUpperCase()}</span>
-                                <span>•</span>
-                                <span>TYPE: {acc.account_type?.toUpperCase()}</span>
-                              </div>
-                            </div>
-
-                            <div className="text-right">
-                              <span className={`text-[9px] font-bold px-2.5 py-1 rounded-md uppercase border ${
-                                acc.is_virtual 
-                                  ? "bg-emerald-500/10 border-emerald-500/20 text-emerald-400" 
-                                  : "bg-amber-500/10 border-amber-500/20 text-amber-400"
-                              }`}>
-                                {acc.is_virtual ? "Demo Acc" : "Real Acc"}
-                              </span>
-                            </div>
-                          </div>
-                        ))}
                       </div>
-                    </div>
+                    )}
                   </div>
                 ) : (
                   <div className="p-4 text-center border border-white/5 bg-black/20 rounded-xl">
